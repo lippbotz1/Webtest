@@ -257,6 +257,11 @@
   }
   .toast.show { opacity:1; transform:translateX(-50%) translateY(0); }
 
+  .full-track-panel { margin:0 0 18px; padding:14px; border:1px solid rgba(0,229,255,.2); border-radius:14px; background:rgba(0,229,255,.045); }
+  .full-track-btn { display:block; text-align:center; padding:12px 14px; border-radius:10px; background:rgba(0,229,255,.13); color:var(--accent); font-size:.88rem; font-weight:700; cursor:pointer; }
+  .full-track-note { margin-top:9px; color:var(--text-dim); font-size:.74rem; line-height:1.55; }
+  .source-note { color:var(--warn); font-size:.75rem; text-align:center; margin:-8px 0 14px; line-height:1.5; }
+
   @media (max-width:480px) {
     .album-art { width:170px; height:170px; border-radius:16px; }
     .song-title-lg { font-size:1.05rem; }
@@ -279,6 +284,12 @@
     </div>
   </div>
 
+  <div class="full-track-panel">
+    <label for="mp3Input" class="full-track-btn">＋ Pilih MP3 Full Durasi</label>
+    <input id="mp3Input" type="file" accept="audio/*,.mp3,.m4a,.wav,.ogg,.flac" hidden>
+    <div class="full-track-note">Untuk memutar lagu sampai selesai, pilih file audio lengkap dari perangkat. Hasil pencarian online bisa berupa cuplikan preview.</div>
+  </div>
+
   <div id="resultsView">
     <div class="center-state">
       <span class="big-icon">🎵</span>
@@ -295,7 +306,8 @@
       <div class="song-title-lg" id="playerTitle">—</div>
       <div class="song-artist-lg" id="playerArtist">—</div>
     </div>
-    <audio id="audioPlayer" controls preload="auto"></audio>
+    <audio id="audioPlayer" controls preload="metadata"></audio>
+    <div id="audioSourceNote" class="source-note" hidden></div>
 
     <div class="lyrics-header">
       <span>Lirik</span>
@@ -371,6 +383,9 @@ var audioPlayer = document.getElementById('audioPlayer');
 var lyricsDisplay = document.getElementById('lyricsDisplay');
 var lyricsBadge = document.getElementById('lyricsBadge');
 var toast = document.getElementById('toast');
+var mp3Input = document.getElementById('mp3Input');
+var audioSourceNote = document.getElementById('audioSourceNote');
+var localAudioUrl = null;
 
 
 /* ==========================================
@@ -558,8 +573,14 @@ async function selectTrack(track) {
   playerTitle.textContent = track.trackName || 'Unknown';
   playerArtist.textContent = track.artistName || '';
 
-  audioPlayer.src = track.previewUrl;
+  if (localAudioUrl) {
+    URL.revokeObjectURL(localAudioUrl);
+    localAudioUrl = null;
+  }
+  audioPlayer.src = track.previewUrl || '';
   audioPlayer.currentTime = 0;
+  audioSourceNote.hidden = false;
+  audioSourceNote.textContent = 'Catatan: sumber pencarian ini adalah cuplikan preview, bukan lagu penuh. Pilih MP3 full durasi di halaman pencarian untuk mendengarkan lagu lengkap.';
 
   lyricsDisplay.innerHTML =
     '<div class="center-state" style="padding:40px 20px">' +
@@ -595,13 +616,16 @@ async function selectTrack(track) {
       '</div>';
   }
 
-  try {
-    await audioPlayer.play();
-    albumArt.classList.add('playing');
-  } catch(e) {
-    showToast('▶ Tekan play untuk memulai');
+  if (audioPlayer.src) {
+    try {
+      await audioPlayer.play();
+      albumArt.classList.add('playing');
+    } catch(e) {
+      showToast('▶ Tekan play untuk memulai');
+    }
+  } else {
+    showToast('Sumber audio tidak menyediakan preview');
   }
-
   startFollowLyrics();
 }
 
@@ -716,7 +740,10 @@ function renderLines(timings) {
       var idx = parseInt(el.dataset.idx, 10);
       currentActiveLine = idx - 1;
       setActiveLine(idx);
-      if (audioPlayer.paused) audioPlayer.play();
+      if (audioPlayer.src && Number.isFinite(Number(lineTimings[idx].time))) {
+        audioPlayer.currentTime = Number(lineTimings[idx].time);
+      }
+      if (audioPlayer.paused && audioPlayer.src) audioPlayer.play();
     };
   });
 }
@@ -729,45 +756,29 @@ function startFollowLyrics() {
   stopFollowLyrics();
   if (!lineTimings.length) return;
 
-  var previewDur = 30;
-  var totalLines = lineTimings.length;
-
-  function updatePreviewDur() {
-    if (audioPlayer.duration && audioPlayer.duration > 5) {
-      previewDur = audioPlayer.duration;
-    }
-  }
-  updatePreviewDur();
-  audioPlayer.addEventListener('loadedmetadata', updatePreviewDur, { once: true });
-
-  var lineStartTime = [];
-  for (var i = 0; i < totalLines; i++) {
-    lineStartTime.push((i / totalLines) * previewDur);
-  }
-
+  // Gunakan timestamp asli dari LRC, bukan membagi lirik rata sepanjang audio.
   function loop() {
-    if (!audioPlayer.src) return;
+    if (!audioPlayer.src || audioPlayer.paused || audioPlayer.ended) return;
     var t = audioPlayer.currentTime;
     var activeIdx = -1;
-    for (var i = 0; i < lineStartTime.length; i++) {
-      if (lineStartTime[i] <= t) activeIdx = i;
+    for (var i = 0; i < lineTimings.length; i++) {
+      if (Number(lineTimings[i].time) <= t) activeIdx = i;
       else break;
     }
-
     if (activeIdx !== currentActiveLine) {
       currentActiveLine = activeIdx;
       setActiveLine(activeIdx);
       if (activeIdx >= 0) scrollToLine(activeIdx);
     }
-
     if (activeIdx >= 0) {
-      var lineStart = lineStartTime[activeIdx];
-      var lineEnd = (activeIdx + 1 < lineStartTime.length) ? lineStartTime[activeIdx + 1] : previewDur;
-      var dur = Math.max(0.3, lineEnd - lineStart);
-      var prog = Math.max(0, Math.min(1, (t - lineStart) / dur));
+      var lineStart = Number(lineTimings[activeIdx].time) || 0;
+      var nextStart = activeIdx + 1 < lineTimings.length
+        ? Number(lineTimings[activeIdx + 1].time)
+        : (Number(audioPlayer.duration) || lineStart + 4);
+      var dur = Math.max(0.25, nextStart - lineStart);
+      var prog = Math.max(0, Math.min(0.999, (t - lineStart) / dur));
       updateWordProgress(activeIdx, prog);
     }
-
     followRafId = requestAnimationFrame(loop);
   }
   loop();
@@ -832,12 +843,68 @@ audioPlayer.addEventListener('seeked', function(){
 
 
 /* ==========================================
+   🎧 LOCAL AUDIO FULL DURASI
+   ========================================== */
+mp3Input.addEventListener('change', async function() {
+  var file = mp3Input.files && mp3Input.files[0];
+  if (!file) return;
+  if (localAudioUrl) URL.revokeObjectURL(localAudioUrl);
+  localAudioUrl = URL.createObjectURL(file);
+
+  var baseName = file.name.replace(/\\.[^.]+$/, '').replace(/[_]+/g, ' ').trim();
+  var parts = baseName.split(/\\s+-\\s+/);
+  var artist = parts.length > 1 ? parts[0].trim() : '';
+  var title = parts.length > 1 ? parts.slice(1).join(' - ').trim() : baseName;
+
+  currentTrack = { trackName:title || baseName, artistName:artist || 'Artis tidak diketahui', artworkUrl100:'', previewUrl:'' };
+  resultsView.style.display = 'none';
+  playerView.style.display = 'block';
+  backBtn.style.display = 'flex';
+  albumArt.classList.remove('playing');
+  playerTitle.textContent = currentTrack.trackName;
+  playerArtist.textContent = currentTrack.artistName;
+  audioPlayer.src = localAudioUrl;
+  audioPlayer.load();
+  audioSourceNote.hidden = false;
+  audioSourceNote.textContent = 'Memutar file lokal lengkap: ' + file.name + '. Durasi mengikuti file asli di perangkat.';
+  lyricsBadge.textContent = 'Mencari lirik...';
+  lyricsBadge.className = 'lyrics-badge';
+  lyricsDisplay.innerHTML = '<div class="center-state"><div class="spinner"></div><div class="sub">Mencari lirik...</div></div>';
+  lineTimings = [];
+  currentActiveLine = -1;
+
+  var lyricsResult = null;
+  try {
+    if (artist) lyricsResult = await fetchLyrics(artist, title);
+    if (!lyricsResult) lyricsResult = await fetchLyrics('', title);
+  } catch(e) {}
+  if (audioPlayer.src !== localAudioUrl) return;
+  if (lyricsResult) {
+    renderLyricsWithTiming(lyricsResult);
+    lyricsBadge.textContent = lyricsResult.type === 'synced' ? '✨ Sinkron LRC' : '📄 Lirik tanpa waktu';
+    lyricsBadge.className = lyricsResult.type === 'synced' ? 'lyrics-badge ok' : 'lyrics-badge warn';
+    if (lyricsResult.type !== 'synced') showToast('Lirik tanpa timestamp ditemukan; sinkronisasi hanya perkiraan.');
+  } else {
+    lyricsBadge.textContent = 'Lirik tidak ditemukan';
+    lyricsBadge.className = 'lyrics-badge warn';
+    lyricsDisplay.innerHTML = '<div class="center-state"><span class="big-icon">📭</span><div class="sub">Lirik tidak ditemukan. Coba cari judul dan artis yang benar.</div></div>';
+  }
+  try { await audioPlayer.play(); } catch(e) { showToast('Tekan play untuk memulai lagu lengkap'); }
+  startFollowLyrics();
+});
+window.addEventListener('beforeunload', function() {
+  if (localAudioUrl) URL.revokeObjectURL(localAudioUrl);
+});
+
+
+/* ==========================================
    ← BACK
    ========================================== */
 function backToSearch() {
   stopFollowLyrics();
   audioPlayer.pause();
   audioPlayer.src = '';
+  audioSourceNote.hidden = true;
   albumArt.classList.remove('playing');
   currentTrack = null;
   lineTimings = [];
