@@ -612,7 +612,7 @@ async function selectTrack(track) {
     lyricsDisplay.innerHTML =
       '<div class="center-state" style="padding:40px 20px">' +
         '<span class="big-icon" style="font-size:2rem">📭</span>' +
-        '<div class="sub">Lirik tidak ditemukan untuk lagu ini</div>' +
+        '<div class="sub">' + escapeHtml(lastLyricsError || 'Lirik tidak ditemukan untuk lagu ini') + '</div>' +
       '</div>';
   }
 
@@ -633,42 +633,136 @@ async function selectTrack(track) {
 /* ==========================================
    📖 FETCH LYRICS
    ========================================== */
-async function fetchLyrics(artist, track) {
-  // Endpoint 1: /api/get
-  try {
-    var url = 'https://lrclib.net/api/get?' +
-      'artist_name=' + encodeURIComponent(artist || '') +
-      '&track_name=' + encodeURIComponent(track || '');
-    var res = await fetchWithTimeout(url, 8000);
-    if (res.ok) {
-      var data = await res.json();
-      if (data) {
-        if (data.syncedLyrics) return { type: 'synced', text: data.syncedLyrics };
-        if (data.plainLyrics)  return { type: 'plain',  text: data.plainLyrics };
-      }
-    }
-  } catch(e) {}
+var lastLyricsError = '';
 
-  // Endpoint 2: /api/search
-  try {
-    var q = (artist || '') + ' ' + (track || '');
-    var sr = await fetchWithTimeout('https://lrclib.net/api/search?q=' + encodeURIComponent(q), 8000);
-    if (!sr.ok) return null;
-    var list = await sr.json();
-    if (!list || !list.length) return null;
-
-    for (var i = 0; i < list.length; i++) {
-      if (list[i].syncedLyrics) return { type: 'synced', text: list[i].syncedLyrics };
-    }
-    for (var j = 0; j < list.length; j++) {
-      if (list[j].plainLyrics) return { type: 'plain', text: list[j].plainLyrics };
-    }
-    return null;
-  } catch(e) {
-    return null;
-  }
+function normalizeLyricsKey(value) {
+  return String(value || '')
+    .toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/\(.*?\)|\[.*?\]/g, ' ')
+    .replace(/\b(official|audio|video|lyrics|lyric|remastered|live|audio version|official video)\b/g, ' ')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+    .replace(/\s+/g, ' ');
 }
 
+function chooseLyricsRecord(records, artist, track) {
+  if (!Array.isArray(records) || !records.length) return null;
+  var wantedTitle = normalizeLyricsKey(track);
+  var wantedArtist = normalizeLyricsKey(artist);
+  var scored = records.filter(function(r) {
+    return r && !r.instrumental && (r.syncedLyrics || r.plainLyrics);
+  }).map(function(r) {
+    var title = normalizeLyricsKey(r.trackName || r.name);
+    var by = normalizeLyricsKey(r.artistName);
+    var score = 0;
+    if (title && wantedTitle && title === wantedTitle) score += 10;
+    else if (title && wantedTitle && (title.includes(wantedTitle) || wantedTitle.includes(title))) score += 4;
+    if (by && wantedArtist && by === wantedArtist) score += 8;
+    else if (by && wantedArtist && (by.includes(wantedArtist) || wantedArtist.includes(by))) score += 3;
+    if (r.syncedLyrics) score += 2;
+    return { record: r, score: score };
+  }).sort(function(a, b) { return b.score - a.score; });
+
+  if (!scored.length) return null;
+  // Avoid returning lyrics for an obviously unrelated song.
+  if (wantedTitle && scored[0].score < 4) return null;
+  var best = scored[0].record;
+  return {
+    type: best.syncedLyrics ? 'synced' : 'plain',
+    text: best.syncedLyrics || best.plainLyrics,
+    trackName: best.trackName || best.name || '',
+    artistName: best.artistName || ''
+  };
+}
+
+async function fetchLyrics(artist, track) {
+  lastLyricsError = '';
+  artist = String(artist || '').trim();
+  track = String(track || '').trim();
+  if (!track) {
+    lastLyricsError = 'Judul lagu kosong. Isi judul lagu terlebih dahulu.';
+    return null;
+  }
+
+  var requests = [];
+  // Exact lookup works best when both title and artist are available.
+  if (artist) {
+    requests.push({
+      kind: 'get',
+      url: 'https://lrclib.net/api/get?artist_name=' + encodeURIComponent(artist) +
+        '&track_name=' + encodeURIComponent(track)
+    });
+  }
+
+  // Structured search is more flexible than relying on one broad query.
+  requests.push({
+    kind: 'search',
+    url: 'https://lrclib.net/api/search?track_name=' + encodeURIComponent(track) +
+      (artist ? '&artist_name=' + encodeURIComponent(artist) : '')
+  });
+  requests.push({
+    kind: 'search',
+    url: 'https://lrclib.net/api/search?q=' + encodeURIComponent([artist, track].filter(Boolean).join(' '))
+  });
+  requests.push({
+    kind: 'search',
+    url: 'https://lrclib.net/api/search?q=' + encodeURIComponent(track)
+  });
+
+  var sawNetworkError = false;
+  var sawRateLimit = false;
+  var sawServerError = false;
+
+  for (var i = 0; i < requests.length; i++) {
+    try {
+      var res = await fetchWithTimeout(requests[i].url, 10000);
+      if (res.status === 429) {
+        sawRateLimit = true;
+        continue;
+      }
+      if (res.status >= 500) {
+        sawServerError = true;
+        continue;
+      }
+      if (res.status === 404) continue;
+      if (!res.ok) continue;
+
+      var data = await res.json();
+      if (requests[i].kind === 'get') {
+        if (data && !data.instrumental && (data.syncedLyrics || data.plainLyrics)) {
+          return {
+            type: data.syncedLyrics ? 'synced' : 'plain',
+            text: data.syncedLyrics || data.plainLyrics,
+            trackName: data.trackName || data.name || '',
+            artistName: data.artistName || ''
+          };
+        }
+      } else {
+        var chosen = chooseLyricsRecord(data, artist, track);
+        if (chosen) return chosen;
+      }
+    } catch (e) {
+      sawNetworkError = true;
+    }
+
+    // Keep requests sequential and gentle on the free lyrics service.
+    if (i < requests.length - 1) {
+      await new Promise(function(resolve) { setTimeout(resolve, 250); });
+    }
+  }
+
+  if (sawRateLimit) {
+    lastLyricsError = 'Layanan lirik sedang membatasi permintaan. Tunggu sebentar lalu coba lagi.';
+  } else if (sawNetworkError) {
+    lastLyricsError = 'Tidak bisa terhubung ke layanan lirik. Periksa internet, lalu buka halaman ini di browser biasa.';
+  } else if (sawServerError) {
+    lastLyricsError = 'Layanan lirik sedang bermasalah. Coba lagi beberapa saat.';
+  } else {
+    lastLyricsError = 'Lirik belum tersedia atau judul/artis tidak cocok di database.';
+  }
+  return null;
+}
 
 /* ==========================================
    🎬 RENDER LYRICS
